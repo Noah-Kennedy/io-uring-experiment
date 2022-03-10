@@ -1,13 +1,14 @@
-use io_uring::types::Fd;
-use io_uring::{opcode, CompletionQueue, SubmissionQueue, Submitter};
-use libc::{c_int, sockaddr, socklen_t};
-use socket2::SockAddr;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::net::SocketAddrV4;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::{io, mem};
+
+use io_uring::types::Fd;
+use io_uring::{opcode, CompletionQueue, SubmissionQueue, Submitter};
+use libc::{c_int, sockaddr, socklen_t};
+use socket2::SockAddr;
 
 const RESPONSE: &'static [u8] =
     b"HTTP/1.1 200 OK\nContent-Type: text/plain\nContent-Length: 12\n\nHello world!";
@@ -60,42 +61,45 @@ fn main() {
     let mut counter = 0;
     let mut addr_store = HashMap::new();
 
-    loop {
-        let (mut submitter, mut squeue, mut completions) = uring.split();
+    let user_data = UserData {
+        kind: EventKind::Accept,
+        id: counter,
+    };
 
-        // println!("{}", counter);
-        let user_data = UserData {
-            kind: EventKind::Accept,
-            id: counter,
-        };
+    let (mut submitter, mut squeue, mut completions) = uring.split();
 
-        for _ in 0..1 {
-            unsafe {
-                submit_accept(
-                    &listener,
-                    &mut submitter,
-                    &mut squeue,
-                    user_data,
-                    &mut addr_store,
-                )
-                .unwrap()
-            }
+    for _ in 0..64 {
+        unsafe {
+            submit_accept(
+                &listener,
+                &mut submitter,
+                &mut squeue,
+                user_data,
+                &mut addr_store,
+            )
+            .unwrap()
         }
 
+        counter += 1;
+    }
+
+    loop {
         unsafe {
             handle_completions(
+                &listener,
+                &mut counter,
                 &mut submitter,
                 &mut squeue,
                 &mut completions,
                 &mut addr_store,
             );
         }
-
-        counter += 1;
     }
 }
 
 unsafe fn handle_completions(
+    listener: &socket2::Socket,
+    counter: &mut u32,
     submitter: &mut Submitter,
     squeue: &mut SubmissionQueue,
     completions: &mut CompletionQueue,
@@ -116,6 +120,15 @@ unsafe fn handle_completions(
                     submit_send(&sock, submitter, squeue).unwrap();
                     mem::forget(sock);
                 }
+
+                let user_data = UserData {
+                    kind: EventKind::Accept,
+                    id: *counter,
+                };
+
+                *counter += 1;
+
+                submit_accept(&listener, submitter, squeue, user_data, store).unwrap()
             }
             EventKind::Write => {
                 let sock = socket2::Socket::from_raw_fd(user_data.id as i32);
@@ -127,7 +140,6 @@ unsafe fn handle_completions(
     }
 }
 
-#[inline]
 unsafe fn submit_close(
     stream: &socket2::Socket,
     submitter: &mut Submitter,
@@ -150,7 +162,6 @@ unsafe fn submit_close(
     Ok(())
 }
 
-#[inline]
 unsafe fn submit_accept(
     listener: &socket2::Socket,
     submitter: &mut Submitter,
@@ -180,7 +191,6 @@ unsafe fn submit_accept(
     Ok(())
 }
 
-#[inline]
 unsafe fn submit_send(
     stream: &socket2::Socket,
     submitter: &mut Submitter,

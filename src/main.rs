@@ -1,7 +1,7 @@
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
-use std::net::SocketAddrV4;
+use std::net::SocketAddrV6;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::{io, mem};
 
@@ -22,7 +22,7 @@ const URING_QUEUE_SIZE: u32 = 256;
 enum EventKind {
     Accept = 0,
     Write = 1,
-    Close = 2,
+    Read = 2,
 }
 
 #[repr(packed)]
@@ -39,16 +39,18 @@ struct AddrPinned {
 
 fn main() {
     let listener = socket2::Socket::new(
-        socket2::Domain::IPV4,
+        socket2::Domain::IPV6,
         socket2::Type::STREAM,
         Some(socket2::Protocol::TCP),
     )
     .unwrap();
 
     listener
-        .bind(&SockAddr::from(SocketAddrV4::new(
-            "127.0.0.1".parse().unwrap(),
-            8080,
+        .bind(&SockAddr::from(SocketAddrV6::new(
+            "::1".parse().unwrap(),
+            3000,
+            0,
+            0,
         )))
         .unwrap();
 
@@ -60,6 +62,7 @@ fn main() {
 
     let mut counter = 0;
     let mut addr_store = HashMap::new();
+    let mut buf_store = HashMap::new();
 
     let user_data = UserData {
         kind: EventKind::Accept,
@@ -92,6 +95,7 @@ fn main() {
                 &mut squeue,
                 &mut completions,
                 &mut addr_store,
+                &mut buf_store,
             );
         }
     }
@@ -104,6 +108,7 @@ unsafe fn handle_completions(
     squeue: &mut SubmissionQueue,
     completions: &mut CompletionQueue,
     store: &mut HashMap<u32, Box<AddrPinned>>,
+    bufs: &mut HashMap<u32, Vec<u8>>,
 ) {
     submitter.submit_and_wait(1).unwrap();
     completions.sync();
@@ -117,7 +122,7 @@ unsafe fn handle_completions(
                     let data = user_data.id;
                     let _ = store.remove(&data);
                     let sock = socket2::Socket::from_raw_fd(c.result());
-                    submit_send(&sock, submitter, squeue).unwrap();
+                    submit_read(&sock, submitter, squeue, bufs).unwrap();
                     mem::forget(sock);
                 }
 
@@ -132,29 +137,37 @@ unsafe fn handle_completions(
             }
             EventKind::Write => {
                 let sock = socket2::Socket::from_raw_fd(user_data.id as i32);
-                submit_close(&sock, submitter, squeue).unwrap();
+                submit_read(&sock, submitter, squeue, bufs).unwrap();
                 mem::forget(sock);
             }
-            EventKind::Close => {}
+            EventKind::Read => {
+                let sock = socket2::Socket::from_raw_fd(user_data.id as i32);
+                submit_send(&sock, submitter, squeue).unwrap();
+                mem::forget(sock);
+            }
         }
     }
 }
 
-unsafe fn submit_close(
+unsafe fn submit_read(
     stream: &socket2::Socket,
     submitter: &mut Submitter,
     squeue: &mut SubmissionQueue,
+    bufs: &mut HashMap<u32, Vec<u8>>,
 ) -> io::Result<()> {
     let user_data = UserData {
-        kind: EventKind::Close,
-        id: 0,
+        kind: EventKind::Read,
+        id: stream.as_raw_fd() as u32,
     };
 
-    let entry = opcode::Close::new(Fd(stream.as_raw_fd()))
+    let buf = bufs.entry(user_data.id).or_insert_with(|| vec![0; 4096]);
+
+    let entry = opcode::Recv::new(Fd(stream.as_raw_fd()), buf.as_mut_ptr(), buf.len() as u32)
         .build()
         .user_data(mem::transmute(user_data));
 
     while squeue.push(&entry).is_err() {
+        println!("Failed to push send");
         submitter.submit().unwrap();
     }
 
